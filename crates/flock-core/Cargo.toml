@@ -7,6 +7,8 @@ authors.workspace = true
 description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
 
 [features]
+# Experimental external AB arithmetic, original APIs unchanged.
+resident-ab-backend = []
 # Reuse dead packed A/B owners for the identical zerocheck tail. Default off.
 reuse-zerocheck-inputs = []
 

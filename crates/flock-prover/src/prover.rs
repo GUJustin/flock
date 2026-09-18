@@ -718,3 +718,179 @@ pub fn prove_fast_ligerito_timed<Ch: Challenger>(
     let claim = R1csClaim { ab, c };
     (proof, commitment, claim, t)
 }
+
+#[cfg(all(
+    feature = "resident-ab-backend",
+    not(feature = "reuse-zerocheck-inputs")
+))]
+#[allow(clippy::too_many_arguments)]
+/// Bind the statement and reduce using the trusted external AB backend.
+///
+/// Any returned error aborts the proof attempt. Statement binding occurs before
+/// backend admission, so even an admission error may leave the challenger changed.
+/// Do not retry or fall back using that challenger. Borrowed-path A/B owners are
+/// returned to scratch before a returned backend error is propagated.
+pub fn prove_fast_core_bound_with_ab_backend<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: Vec<F128>,
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    commitment: Commitment,
+    prover_data: Option<pcs::ProverData>,
+    options: zerocheck::ProverOptions,
+    challenger: &mut Ch,
+    backend: &mut impl zerocheck::resident_ab::AbBackend,
+) -> Result<ProveCore, String> {
+    let commit_started = std::time::Instant::now();
+    bind_statement(challenger, r1cs, &commitment);
+    if std::env::var("FLOCK_TRACE").is_ok() {
+        eprintln!(
+            "  [prove_core m={}] commit: {:7.1} ms",
+            r1cs.m,
+            commit_started.elapsed().as_secs_f64() * 1e3,
+        );
+    }
+    Ok(prove_fast_core_reduction_after_statement_with_ab_backend(
+        r1cs,
+        &z_packed,
+        a_packed_f128,
+        b_packed_f128,
+        z_packed_lincheck,
+        lincheck_circuit,
+        options,
+        challenger,
+        backend,
+    )?
+    .with_witness(z_packed, commitment, prover_data))
+}
+
+#[cfg(all(
+    feature = "resident-ab-backend",
+    not(feature = "reuse-zerocheck-inputs")
+))]
+#[allow(clippy::too_many_arguments)]
+/// Reduce after the caller has already bound the statement, using external AB
+/// arithmetic and the unchanged CPU lincheck and claim preparation.
+///
+/// This function does not bind the statement again. On error, abandon the proof
+/// attempt and its potentially advanced challenger; no fallback or replay occurs.
+/// Only returned errors guarantee A/B scratch recycling, not an unwinding panic.
+pub fn prove_fast_core_reduction_after_statement_with_ab_backend<Ch: Challenger>(
+    r1cs: &BlockR1cs,
+    z_packed: &[F128],
+    a_packed_f128: Vec<F128>,
+    b_packed_f128: Vec<F128>,
+    z_packed_lincheck: Vec<u8>,
+    lincheck_circuit: &dyn lincheck::LincheckCircuit,
+    options: zerocheck::ProverOptions,
+    challenger: &mut Ch,
+    backend: &mut impl zerocheck::resident_ab::AbBackend,
+) -> Result<ProveCoreReduction, String> {
+    let trace = std::env::var("FLOCK_TRACE").is_ok();
+    let mut stage = std::time::Instant::now();
+    let mut lap = |label: &str| {
+        if trace {
+            eprintln!(
+                "  [prove_core m={}] {label}: {:7.1} ms",
+                r1cs.m,
+                stage.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage = std::time::Instant::now();
+    };
+    let padding = r1cs.padding_spec();
+    let zerocheck_span = tracing::info_span!("flock.core.zerocheck").entered();
+    let (zc_proof, zc_claim, s_hat_v_c) = {
+        // C aliases z and stays borrowed across both implementation paths.
+        let c_packed: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                z_packed.as_ptr() as *const u8,
+                core::mem::size_of_val(z_packed),
+            )
+        };
+        let a_packed = unsafe {
+            std::slice::from_raw_parts(
+                a_packed_f128.as_ptr() as *const u8,
+                core::mem::size_of_val(a_packed_f128.as_slice()),
+            )
+        };
+        let b_packed = unsafe {
+            std::slice::from_raw_parts(
+                b_packed_f128.as_ptr() as *const u8,
+                core::mem::size_of_val(b_packed_f128.as_slice()),
+            )
+        };
+        let result = zerocheck::resident_ab::prove_capture_with_backend(
+            a_packed, b_packed, c_packed, r1cs.m, &padding, options, challenger, backend,
+        );
+        flock_core::scratch::give_f128(a_packed_f128);
+        flock_core::scratch::give_f128(b_packed_f128);
+        result?
+    };
+    drop(zerocheck_span);
+    lap("zerocheck");
+
+    let lincheck_span = tracing::info_span!("flock.core.lincheck").entered();
+    let x_ab = r1cs.x_ab_from_mlv(zc_claim.z, &zc_claim.mlv_challenges);
+
+    // Capture lincheck's pre-sumcheck z_vec so the PCS open can derive the
+    // AB-claim's `s_hat_v` from it (skips fold_1b_rows for AB).
+    let (lc_proof, lc_claim, z_vec_pre) = lincheck::prove_padded_capture_z_vec(
+        &z_packed_lincheck,
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        r1cs.useful_bits,
+        lincheck_circuit,
+        &x_ab,
+        challenger,
+    );
+    // The lincheck stripe copy of z is dead from here on; free it before the
+    // PCS open (2^(m-3) bytes — 64 MB at m = 29).
+    drop(z_packed_lincheck);
+    drop(lincheck_span);
+    lap("lincheck");
+    let claim_span = tracing::info_span!("flock.core.claim_preparation").entered();
+
+    let ab = ZClaim {
+        point: r1cs.ab_claim_point(lc_claim.r_inner_skip, &lc_claim.r_inner_rest, &x_ab.x_outer),
+        value: lc_claim.w,
+    };
+    let c = ZClaim {
+        point: r1cs.c_claim_point(zc_claim.z, &zc_claim.r_rest),
+        value: zc_claim.c_eval,
+    };
+
+    // Strided fold of z_vec_pre against the AB-claim suffix's inner-rest tail
+    // (everything past prefix0). Byte-identical to `fold_1b_rows` on the AB
+    // suffix tensor — see `s_hat_v_from_z_vec`. Skip when k_log < LOG_PACKING
+    // (only test setups; real R1CS has k_log >= 16).
+    let s_hat_v_ab = if r1cs.k_log >= pcs::LOG_PACKING {
+        Some(pcs::ring_switch::s_hat_v_from_z_vec(
+            &z_vec_pre,
+            &lc_claim.r_inner_rest[1..],
+        ))
+    } else {
+        None
+    };
+
+    drop(claim_span);
+    lap("s_hat_v_ab");
+    Ok(ProveCoreReduction {
+        zc_proof,
+        lc_proof,
+        ab,
+        c,
+        s_hat_v_ab,
+        s_hat_v_c,
+    })
+}
+
+// The resident backend currently borrows packed A/B and owns its separate
+// initialized output storage. Reusing packed owners is a distinct API contract.
+#[cfg(all(feature = "resident-ab-backend", feature = "reuse-zerocheck-inputs"))]
+compile_error!(
+    "resident-ab-backend and reuse-zerocheck-inputs cannot be enabled together; select the borrowed resident backend or the CPU owned-input route"
+);

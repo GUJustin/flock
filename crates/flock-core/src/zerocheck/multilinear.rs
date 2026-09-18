@@ -456,25 +456,102 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
     mlv_challenges: &[F128],
     padding: &PaddingSpec,
 ) -> (Vec<F128>, Vec<F128>, F128, F128) {
-    use rayon::prelude::*;
+    let n_out = validate_univariate_into_shape(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+    );
+    let mut a = crate::scratch::take_f128(n_out);
+    let mut b = crate::scratch::take_f128(n_out);
+    let (m1, mi) = uni_skip_fold_and_round_pair_optimized_packed_padded_into(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+        &mut a,
+        &mut b,
+    );
+    (a, b, m1, mi)
+}
 
+// Validate packed-input geometry and return the required output length.
+fn validate_univariate_into_shape(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+) -> usize {
     assert_eq!(
         k_skip, 6,
         "optimized fold-and-round_pair variant is k_skip=6 only"
     );
     assert_eq!(table.n_chunks, 8);
+    assert_eq!(table.data.len(), 8 * 256);
+    assert!(padding.k_log <= m && padding.k_log < usize::BITS as usize);
+    assert!(padding.useful_bits_per_block <= (1usize << padding.k_log));
     let n_chunks = table.n_chunks;
-    let n_out = 1usize << (m - k_skip);
-    assert_eq!(a_packed.len(), n_out * n_chunks);
-    assert_eq!(b_packed.len(), n_out * n_chunks);
+    let log_out = m.checked_sub(k_skip).expect("m below k_skip");
+    assert!(log_out >= 1 && log_out < usize::BITS as usize);
+    let n_out = 1usize.checked_shl(log_out as u32).expect("output overflow");
+    let input_len = n_out.checked_mul(n_chunks).expect("input overflow");
+    assert_eq!(a_packed.len(), input_len);
+    assert_eq!(b_packed.len(), input_len);
     assert_eq!(mlv_challenges.len(), m - k_skip);
 
-    // Uninit alloc — the parallel loop below writes every slot (dense path)
-    // or explicitly writes F128::ZERO at padding holes (padded path).
-    // Saves ~22 ms of sequential zero-fill at m=29 (256 MB total) that would
-    // otherwise cap the parallel speedup of this phase at ~2.5× on 8 cores.
-    let mut a_folded: Vec<F128> = crate::scratch::take_f128(n_out);
-    let mut b_folded: Vec<F128> = crate::scratch::take_f128(n_out);
+    n_out
+}
+
+/// Fill initialized caller-owned folded A/B outputs and compute the first message pair.
+///
+/// Each output slice must have exactly `2^(m - k_skip)` elements. Its storage must
+/// already contain valid initialized `F128` values; previous values are overwritten,
+/// including output positions corresponding to zero padding. The two mutable slices
+/// must be disjoint, as required by Rust's mutable-reference rules.
+///
+/// Packed A/B must have the exact admitted byte length. In every padding block,
+/// bits at indices `useful_bits_per_block..2^k_log` must already be zero. This is
+/// a caller precondition: this function validates padding geometry, not those bits.
+/// The table must describe the supported `k_skip = 6` fold and `mlv_challenges`
+/// must contain exactly `m - k_skip` elements.
+///
+/// Execution is synchronous: all Rayon work joins before return, and no input or
+/// output borrow is retained. Invalid input geometry, table shape, challenge count,
+/// or output length panics during admission before any destination write. This
+/// guarantee covers admission failures, not an unexpected panic after work starts.
+pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_into(
+    a_packed: &[u8],
+    b_packed: &[u8],
+    m: usize,
+    k_skip: usize,
+    table: &UniSkipFoldTable,
+    mlv_challenges: &[F128],
+    padding: &PaddingSpec,
+    a_folded: &mut [F128],
+    b_folded: &mut [F128],
+) -> (F128, F128) {
+    use rayon::prelude::*;
+
+    let n_out = validate_univariate_into_shape(
+        a_packed,
+        b_packed,
+        m,
+        k_skip,
+        table,
+        mlv_challenges,
+        padding,
+    );
+    assert_eq!(a_folded.len(), n_out);
+    assert_eq!(b_folded.len(), n_out);
 
     let eq = SplitEqGhash::new(&mlv_challenges[1..]);
     let lo_size = 1usize << eq.n_lo;
@@ -682,8 +759,14 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded(
             |(s1, sinf), (c1, cinf)| (s1 + c1, sinf + cinf),
         );
 
-    (a_folded, b_folded, mlv_challenges[0] * sum1, sum_inf)
+    (mlv_challenges[0] * sum1, sum_inf)
 }
+
+#[cfg(test)]
+include!("univariate_into_oracle.rs");
+#[cfg(test)]
+#[path = "univariate_into_tests.rs"]
+mod univariate_into_tests;
 
 // ---------------------------------------------------------------------------
 // Subsequent multilinear rounds (3..(m−k_skip+1)): fold + next message.

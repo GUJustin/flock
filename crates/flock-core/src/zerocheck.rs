@@ -1154,3 +1154,6 @@ mod tests {
         assert_eq!(claim1.mlv_challenges, claim2.mlv_challenges);
     }
 }
+
+#[cfg(feature = "resident-ab-backend")]
+pub mod resident_ab;
