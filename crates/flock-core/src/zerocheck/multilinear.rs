@@ -719,6 +719,7 @@ pub fn uni_skip_fold_and_round_pair_optimized_packed_padded_into(
                 )
             )))]
             {
+                let n_chunks = table.n_chunks;
                 let base = x_hi * chunk_size;
                 for x_lo in 0..lo_size {
                     let x0l = 2 * x_lo;
