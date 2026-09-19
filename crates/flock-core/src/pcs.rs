@@ -1136,3 +1136,112 @@ mod tests {
 #[cfg(test)]
 #[path = "pcs/borrowed_opening_tests.rs"]
 mod borrowed_opening_tests;
+
+/// Experimental synchronous resident initial prefix. CPU default unchanged.
+/// Backend errors are fatal to this transcript attempt; never replay automatically.
+#[cfg(feature = "resident-pcs-prefix")]
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_resident_prefix<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    codeword: &[F128],
+    merkle_tree: &[crate::merkle::Hash],
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+    backend: &mut dyn ligerito::resident_prefix::InitialFoldBackend,
+) -> Result<BatchOpeningProofLigerito, String> {
+    // Avoid unchecked PcsParams shifts/subtractions on untrusted geometry.
+    let params = &commitment.params;
+    let msg_log = params
+        .m
+        .checked_sub(LOG_PACKING)
+        .ok_or("m below packing log")?;
+    let position_log = msg_log
+        .checked_sub(params.log_batch_size)
+        .and_then(|x| x.checked_add(params.log_inv_rate))
+        .ok_or("invalid L0 position geometry")?;
+    let codeword_log = msg_log
+        .checked_add(params.log_inv_rate)
+        .ok_or("L0 codeword log overflow")?;
+    let pow2 = |log: usize| -> Result<usize, String> {
+        let shift = u32::try_from(log).map_err(|_| "L0 shift overflow")?;
+        1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "L0 extent overflow".into())
+    };
+    let expected_witness = pow2(msg_log)?;
+    let expected_codeword = pow2(codeword_log)?;
+    let expected_tree = pow2(position_log)?
+        .checked_mul(2)
+        .and_then(|x| x.checked_sub(1))
+        .ok_or("L0 tree extent overflow")?;
+    if packed_witness.len() != expected_witness
+        || codeword.len() != expected_codeword
+        || merkle_tree.len() != expected_tree
+    {
+        return Err("precomputed L0 witness/codeword/tree length mismatch".into());
+    }
+    if lig_config.initial_k != params.log_batch_size
+        || lig_config.log_inv_rates.first().copied() != Some(params.log_inv_rate)
+        || lig_config.initial_log_num_interleaved != params.log_batch_size
+        || lig_config.initial_log_msg_cols != msg_log - params.log_batch_size
+    {
+        return Err("Ligerito initial geometry does not match commitment".into());
+    }
+    backend.admit(expected_witness, lig_config.initial_k)?;
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_total = std::time::Instant::now();
+
+    assert_eq!(
+        lig_config.initial_k, commitment.params.log_batch_size,
+        "ligerito initial_k ({}) must match PcsParams.log_batch_size ({}) for L0 reuse",
+        lig_config.initial_k, commitment.params.log_batch_size,
+    );
+    assert_eq!(
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+        "ligerito log_inv_rates[0] ({}) must match PcsParams.log_inv_rate ({}) for L0 reuse",
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+    );
+
+    let combined = compute_combined_basis_and_target(
+        &packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        challenger,
+        trace,
+    );
+
+    let t = std::time::Instant::now();
+    let ligerito_proof = ligerito::resident_prefix::prove_with_backend(
+        lig_config,
+        packed_witness,
+        combined.b_combined,
+        combined.target_combined,
+        codeword,
+        merkle_tree,
+        Some(ligerito::SumcheckMessage { u_0: combined.round0_prime.0, u_2: combined.round0_prime.1 }),
+        challenger,
+        backend,
+    )?;
+    if trace {
+        eprintln!(
+            "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  [open_batch] TOTAL: {:6.2} ms",
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    Ok(BatchOpeningProofLigerito {
+        ring_switches: combined.ring_switches,
+        ligerito: ligerito_proof,
+    })
+}
