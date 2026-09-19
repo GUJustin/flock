@@ -265,6 +265,382 @@ fn compute_combined_basis_and_target<Ch: Challenger>(
     challenger: &mut Ch,
     trace: bool,
 ) -> CombinedClaim {
+    let bundle = prepare_claim_bundle(packed_witness, x_outers,
+        precomputed_s_hat_v, packed_direct, padding, challenger, trace);
+    assemble_claim_bundle_cpu(packed_witness, bundle, trace)
+}
+
+/// Exact transcript frontend output. RS descriptors already contain gamma;
+/// target separately uses the sampled gamma times each original claim value.
+struct ClaimBundle<'a> {
+    rs_results: Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
+    packed_direct: &'a [PackedDirectClaim],
+    gammas_pd: Vec<F128>,
+    target_combined: F128,
+    l: usize,
+    n_rs: usize,
+    n_pd: usize,
+    combine_started: std::time::Instant,
+}
+
+fn prepare_claim_bundle<'a, Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &'a [PackedDirectClaim],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+    trace: bool,
+) -> ClaimBundle<'a> {
+    let n_rs = x_outers.len();
+    let n_pd = packed_direct.len();
+    assert!(n_rs + n_pd > 0, "open_batch_mixed: need at least one claim");
+    assert!(
+        precomputed_s_hat_v.is_empty() || precomputed_s_hat_v.len() == n_rs,
+        "precomputed_s_hat_v: must be empty or length {n_rs}, got {}",
+        precomputed_s_hat_v.len(),
+    );
+
+    challenger.observe_label(b"flock-pcs-open-batch-v0");
+
+    // 1. Ring-switching for all x_outers.
+    let t = std::time::Instant::now();
+    let (rs_results, gammas_rs): (
+        Vec<(RingSwitchProof, ring_switch::RingSwitchBatchOutput)>,
+        Vec<F128>,
+    ) = if n_rs > 0 {
+        ring_switch::prove_batched_padded_with_precomputed(
+            packed_witness,
+            x_outers,
+            precomputed_s_hat_v,
+            padding,
+            challenger,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    if trace {
+        eprintln!(
+            "  [open_batch] ring_switch::prove_batched ×{}: {:6.2} ms",
+            n_rs,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    // 2. Observe packed-direct claim values + sample γ_pd.
+    for pd in packed_direct {
+        challenger.observe_label(b"flock-pcs-packed-direct-v0");
+        challenger.observe_f128(pd.value);
+    }
+    let gammas_pd: Vec<F128> = (0..n_pd).map(|_| challenger.sample_f128()).collect();
+
+    let t = std::time::Instant::now();
+
+    let l = if let Some((_, out)) = rs_results.first() {
+        out.rs_eq_ind.len()
+    } else {
+        1usize << packed_direct[0].point.len()
+    };
+    debug_assert!(rs_results.iter().all(|(_, o)| o.rs_eq_ind.len() == l));
+    debug_assert!(
+        packed_direct.iter().all(|pd| 1usize << pd.point.len() == l),
+        "all packed-direct claims must share L (= packed witness length)"
+    );
+
+    let mut target_combined = F128::ZERO;
+    for ((_, output), g) in rs_results.iter().zip(gammas_rs.iter()) {
+        target_combined += *g * output.sumcheck_claim;
+    }
+    for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
+        target_combined += *g * pd.value;
+    }
+
+    ClaimBundle { rs_results, packed_direct, gammas_pd, target_combined,
+        l, n_rs, n_pd, combine_started: t }
+}
+
+fn assemble_claim_bundle_cpu(
+    packed_witness: &[F128], bundle: ClaimBundle<'_>, trace: bool,
+) -> CombinedClaim {
+    use rayon::prelude::*;
+    let ClaimBundle { rs_results, packed_direct, gammas_pd, target_combined,
+        l, n_rs, n_pd, combine_started: t } = bundle;
+    let rs_baked: Vec<&[F128]> = rs_results
+        .iter()
+        .filter_map(|(_, o)| match &o.rs_eq_ind {
+            ring_switch::RsEqInd::Dense(v) => Some(v.as_slice()),
+            _ => None,
+        })
+        .collect();
+    // Deferred-dense claims (fused fast path): the per-claim `γ_k·B_k` buffer
+    // was never materialized — fold each slot on the fly below and accumulate
+    // straight into `b_combined`, saving a 2^(m-7) materialize + readback per
+    // claim. Carries (eq_lo, eq_hi, γ-baked table, log₂ B).
+    let rs_deferred: Vec<(&[F128], &[F128], &[F128], usize)> = rs_results
+        .iter()
+        .filter_map(|(_, o)| match &o.rs_eq_ind {
+            ring_switch::RsEqInd::DeferredDense {
+                eq_lo,
+                eq_hi,
+                table,
+            } => Some((
+                eq_lo.as_slice(),
+                eq_hi.as_slice(),
+                table.as_slice(),
+                eq_lo.len().trailing_zeros() as usize,
+            )),
+            _ => None,
+        })
+        .collect();
+    // Windowed claims (trailing-Boolean suffixes: the S4 lane lift, zero
+    // pads) are handled by a block-fold post-pass over their window only,
+    // in both the fast and general paths.
+    let rs_windowed: Vec<(usize, &[F128], &[F128], &[F128])> = rs_results
+        .iter()
+        .filter_map(|(_, o)| match &o.rs_eq_ind {
+            ring_switch::RsEqInd::Windowed {
+                offset,
+                eq_lo,
+                eq_hi,
+                table,
+                ..
+            } => Some((*offset, eq_lo.as_slice(), eq_hi.as_slice(), table.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let pd_dense: Vec<(&[F128], F128)> = packed_direct
+        .iter()
+        .zip(gammas_pd.iter())
+        .filter_map(|(pd, g)| match &pd.eq_ind {
+            DirectEqInd::Dense(v) => Some((v.as_slice(), *g)),
+            _ => None,
+        })
+        .collect();
+
+    // ---- Build b_combined (γ-weighted sum of all rs_eq_ind + eq_ind) and the
+    //      round-0 prime (u_0, u_2 over packed_witness · b_combined).
+    let mut b_combined: Vec<F128> = crate::scratch::take_f128(l);
+
+    // Fast path (compression-proof open: claims ab, c; also chain/merkle): every
+    // RS claim is a fused DeferredDense fold and no DENSE packed-direct claim
+    // needs the per-element combine. Fold all claims block-by-block straight into
+    // b_combined — each claim's `e_hi` hoisted once per block, exactly as in
+    // `fold_b128_elems_split` — and fuse the round-0 prime in the same pass.
+    // Neither the per-claim `γ_k·B_k` buffer nor a combine readback is ever
+    // materialized (saves ~2·L writes + 2·L reads of the 2^(m-7) basis).
+    //
+    // Sparse ring-switch and packed-direct claims do not disable this path:
+    // they're scatter-added onto b_combined after the fold (with an
+    // incremental round-0 prime adjustment), so they only require
+    // `pd_dense.is_empty()`, not `packed_direct.is_empty()`. This keeps the two
+    // big ab/c claims on the fused fold instead of materializing them.
+    let use_fast = !rs_deferred.is_empty()
+        && rs_baked.is_empty()
+        && pd_dense.is_empty();
+    if trace {
+        let sparse = rs_results.iter().filter(|(_, out)| {
+            matches!(out.rs_eq_ind, ring_switch::RsEqInd::Sparse { .. })
+        }).count();
+        eprintln!("  [open_batch] basis: deferred={}, sparse={}, windowed={}, fused={use_fast}",
+            rs_deferred.len(), sparse, rs_windowed.len());
+    }
+
+    let (mut round0_u0, mut round0_u2) = if use_fast {
+        let b = rs_deferred[0].0.len(); // eq_lo.len(); shared across claims (same split)
+        debug_assert!(b >= 2 && b.is_multiple_of(2));
+        debug_assert!(rs_deferred.iter().all(|d| d.0.len() == b));
+        // Composition-table setup pays off on the measured large blocks.
+        // Keep the original path for shorter domains.
+        let compose = b >= basis_composition::MIN_BLOCK_CELLS;
+        if trace && compose {
+            eprintln!("  [open_batch] block-map composition: block_cells={b}");
+        }
+        let scratch = || {
+            if compose { vec![F128::ZERO; 4096] } else { Vec::new() }
+        };
+        b_combined
+            .par_chunks_mut(b)
+            .enumerate()
+            .map_init(scratch, |composed, (hi, out_block)| {
+                // Accumulate each claim's block: first claim writes, rest add.
+                // `e_hi` is read once per claim per block, then swept over eq_lo.
+                for (ci, (eq_lo, eq_hi, table, _)) in rs_deferred.iter().enumerate() {
+                    let e_hi = eq_hi[hi];
+                    if compose {
+                        basis_composition::compose_and_fold(
+                            eq_lo, e_hi, table, out_block, composed, ci != 0,
+                        );
+                    } else if ci == 0 {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot = ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    } else {
+                        for (slot, &lo) in out_block.iter_mut().zip(eq_lo.iter()) {
+                            *slot += ring_switch::fold_one_slot(lo * e_hi, table);
+                        }
+                    }
+                }
+                // Round-0 prime over this block's pairs (b is even, base is even).
+                let base = hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                for t in 0..(b / 2) {
+                    let s0 = out_block[2 * t];
+                    let s1 = out_block[2 * t + 1];
+                    let a0 = packed_witness[base + 2 * t];
+                    let a1 = packed_witness[base + 2 * t + 1];
+                    u0 += a0 * s0;
+                    u2 += (a0 + a1) * (s0 + s1);
+                }
+                (u0, u2)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            )
+    } else {
+        // General path (mixed / sparse / packed-direct): materialize any
+        // deferred-dense claims (parallel block fold), then the per-element
+        // combine over all dense buffers + packed-direct, matching the
+        // original behavior.
+        let materialized: Vec<Vec<F128>> = rs_results
+            .iter()
+            .filter_map(|(_, o)| match &o.rs_eq_ind {
+                ring_switch::RsEqInd::DeferredDense {
+                    eq_lo,
+                    eq_hi,
+                    table,
+                } => Some(ring_switch::fold_b128_from_table(eq_lo, eq_hi, table)),
+                _ => None,
+            })
+            .collect();
+        let mut rs_dense_all: Vec<&[F128]> = rs_baked.clone();
+        rs_dense_all.extend(materialized.iter().map(|v| v.as_slice()));
+        let prime = b_combined
+            .par_chunks_mut(2)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut b0 = F128::ZERO;
+                let mut b1 = F128::ZERO;
+                for v in rs_dense_all.iter() {
+                    b0 += v[2 * i];
+                    b1 += v[2 * i + 1];
+                }
+                for (v, g) in pd_dense.iter() {
+                    b0 += *g * v[2 * i];
+                    b1 += *g * v[2 * i + 1];
+                }
+                chunk[0] = b0;
+                chunk[1] = b1;
+                let a0 = packed_witness[2 * i];
+                let a1 = packed_witness[2 * i + 1];
+                (a0 * b0, (a0 + a1) * (b0 + b1))
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+        for v in materialized {
+            crate::scratch::give_f128(v);
+        }
+        prime
+    };
+    // Windowed post-pass: fold each claim's deferred window straight into
+    // its block of b_combined, accumulating the round-0 prime delta over
+    // the touched pairs in the same pass (windows are pair-aligned: size
+    // is a power of two >= 2 and the offset a multiple of it).
+    for &(offset, eq_lo, eq_hi, table) in &rs_windowed {
+        let b = eq_lo.len();
+        let window = b * eq_hi.len();
+        debug_assert!(offset % 2 == 0 && window % 2 == 0);
+        let (du0, du2) = b_combined[offset..offset + window]
+            .par_chunks_mut(b)
+            .enumerate()
+            .map(|(hi, out_block)| {
+                let e_hi = eq_hi[hi];
+                let base = offset + hi * b;
+                let mut u0 = F128::ZERO;
+                let mut u2 = F128::ZERO;
+                let mut t = 0;
+                while t < out_block.len() {
+                    let d0 = ring_switch::fold_one_slot(eq_lo[t] * e_hi, table);
+                    let d1 = ring_switch::fold_one_slot(eq_lo[t + 1] * e_hi, table);
+                    out_block[t] += d0;
+                    out_block[t + 1] += d1;
+                    let a0 = packed_witness[base + t];
+                    let a1 = packed_witness[base + t + 1];
+                    u0 += a0 * d0;
+                    u2 += (a0 + a1) * (d0 + d1);
+                    t += 2;
+                }
+                (u0, u2)
+            })
+            .reduce(
+                || (F128::ZERO, F128::ZERO),
+                |(x0, x2), (y0, y2)| (x0 + y0, x2 + y2),
+            );
+        round0_u0 += du0;
+        round0_u2 += du2;
+    }
+    for (_, output) in rs_results.iter() {
+        if let ring_switch::RsEqInd::Sparse { entries, .. } = &output.rs_eq_ind {
+            let (du0, du2) = scatter_add_indexed_parallel(
+                &mut b_combined, packed_witness, entries.len(),
+                |i| entries[i].0, |i| entries[i].1,
+            );
+            round0_u0 += du0;
+            round0_u2 += du2;
+        }
+    }
+    for (pd, g) in packed_direct.iter().zip(gammas_pd.iter()) {
+        if let DirectEqInd::Sparse(eq) = &pd.eq_ind {
+            // Scatter-add the sparse claim and fold its round-0 prime
+            // contribution in the SAME pass (O(live positions)), instead of a
+            // full O(L) re-pass over b_combined. The prime is linear in
+            // b_combined, so the delta from scattering `g·eq` equals
+            // Σ adjust_prime_for_delta(idx, g·val) over the live positions.
+            let (du0, du2) = sparse_scatter_add_parallel(&mut b_combined, packed_witness, eq, *g);
+            round0_u0 += du0;
+            round0_u2 += du2;
+        }
+    }
+    if trace {
+        eprintln!(
+            "  [open_batch] combine rs_eq_ind (L={}, rs×{}, pd×{}): {:6.2} ms",
+            l,
+            n_rs,
+            n_pd,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    CombinedClaim {
+        ring_switches: rs_results
+            .into_iter()
+            .map(|(p, o)| {
+                // The per-claim rs_eq_ind (L F128s) dies here — recycle it.
+                if let ring_switch::RsEqInd::Dense(v) = o.rs_eq_ind {
+                    crate::scratch::give_f128(v);
+                }
+                p
+            })
+            .collect(),
+        b_combined,
+        target_combined,
+        round0_prime: (round0_u0, round0_u2),
+    }
+}
+
+#[cfg(test)]
+fn original_compute_combined_basis_and_target<Ch: Challenger>(
+    packed_witness: &[F128],
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    challenger: &mut Ch,
+    trace: bool,
+) -> CombinedClaim {
     let n_rs = x_outers.len();
     let n_pd = packed_direct.len();
     assert!(n_rs + n_pd > 0, "open_batch_mixed: need at least one claim");
@@ -1245,3 +1621,235 @@ pub fn open_batch_mixed_ligerito_with_resident_prefix<Ch: Challenger>(
         ligerito: ligerito_proof,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn original_frontend_opening<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    codeword: &[F128],
+    merkle_tree: &[crate::merkle::Hash],
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> Result<BatchOpeningProofLigerito, String> {
+    // Avoid unchecked PcsParams shifts/subtractions on untrusted geometry.
+    let params = &commitment.params;
+    let msg_log = params
+        .m
+        .checked_sub(LOG_PACKING)
+        .ok_or("m below packing log")?;
+    let position_log = msg_log
+        .checked_sub(params.log_batch_size)
+        .and_then(|x| x.checked_add(params.log_inv_rate))
+        .ok_or("invalid L0 position geometry")?;
+    let codeword_log = msg_log
+        .checked_add(params.log_inv_rate)
+        .ok_or("L0 codeword log overflow")?;
+    let pow2 = |log: usize| -> Result<usize, String> {
+        let shift = u32::try_from(log).map_err(|_| "L0 shift overflow")?;
+        1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "L0 extent overflow".into())
+    };
+    let expected_witness = pow2(msg_log)?;
+    let expected_codeword = pow2(codeword_log)?;
+    let expected_tree = pow2(position_log)?
+        .checked_mul(2)
+        .and_then(|x| x.checked_sub(1))
+        .ok_or("L0 tree extent overflow")?;
+    if packed_witness.len() != expected_witness
+        || codeword.len() != expected_codeword
+        || merkle_tree.len() != expected_tree
+    {
+        return Err("precomputed L0 witness/codeword/tree length mismatch".into());
+    }
+    if lig_config.initial_k != params.log_batch_size
+        || lig_config.log_inv_rates.first().copied() != Some(params.log_inv_rate)
+        || lig_config.initial_log_num_interleaved != params.log_batch_size
+        || lig_config.initial_log_msg_cols != msg_log - params.log_batch_size
+    {
+        return Err("Ligerito initial geometry does not match commitment".into());
+    }
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_total = std::time::Instant::now();
+
+    assert_eq!(
+        lig_config.initial_k, commitment.params.log_batch_size,
+        "ligerito initial_k ({}) must match PcsParams.log_batch_size ({}) for L0 reuse",
+        lig_config.initial_k, commitment.params.log_batch_size,
+    );
+    assert_eq!(
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+        "ligerito log_inv_rates[0] ({}) must match PcsParams.log_inv_rate ({}) for L0 reuse",
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+    );
+
+    let combined = original_compute_combined_basis_and_target(
+        &packed_witness,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        challenger,
+        trace,
+    );
+
+    let t = std::time::Instant::now();
+    let ligerito_proof = ligerito::recursive_prover_with_basis_precomputed_round0(
+        lig_config,
+        packed_witness,
+        combined.b_combined,
+        combined.target_combined,
+        codeword,
+        merkle_tree,
+        combined.round0_prime,
+        challenger,
+    );
+    if trace {
+        eprintln!(
+            "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  [open_batch] TOTAL: {:6.2} ms",
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    Ok(BatchOpeningProofLigerito {
+        ring_switches: combined.ring_switches,
+        ligerito: ligerito_proof,
+    })
+}
+
+#[cfg(test)]
+mod claim_frontend_tests;
+
+#[cfg(all(test, feature = "resident-pcs-prefix"))]
+mod started_prefix_tests;
+
+/// Default-off arithmetic-only producer. No challenger access. Descriptors are
+/// gamma-baked actual ring-switch outputs; implementations must not scale again.
+#[cfg(feature="resident-pcs-producer")]
+pub trait BasisProducerBackend: ligerito::resident_prefix::StartedFoldBackend {
+    /// Pure admission before the opening frontend changes the transcript.
+    fn admit_producer(&self, rows:usize, rounds:usize)->Result<(),String>;
+    /// Own f, produce the resident basis and exact round0, retaining both planes.
+    /// Unsupported descriptors or device errors abort this proof attempt.
+    fn produce(&mut self, f:Vec<F128>, descriptors:&[ring_switch::RsEqInd], rounds:usize)
+        ->Result<ligerito::SumcheckMessage,String>;
+}
+
+/// Explicit resident producer opening; existing CPU and copy-prefix APIs unchanged.
+/// Any error after ring-switch frontend mutation is fatal; no fallback/replay.
+#[cfg(feature="resident-pcs-producer")]
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_basis_producer<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    codeword: &[F128],
+    merkle_tree: &[crate::merkle::Hash],
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+    backend: &mut dyn BasisProducerBackend,
+) -> Result<BatchOpeningProofLigerito, String> {
+    // Avoid unchecked PcsParams shifts/subtractions on untrusted geometry.
+    let params = &commitment.params;
+    let msg_log = params
+        .m
+        .checked_sub(LOG_PACKING)
+        .ok_or("m below packing log")?;
+    let position_log = msg_log
+        .checked_sub(params.log_batch_size)
+        .and_then(|x| x.checked_add(params.log_inv_rate))
+        .ok_or("invalid L0 position geometry")?;
+    let codeword_log = msg_log
+        .checked_add(params.log_inv_rate)
+        .ok_or("L0 codeword log overflow")?;
+    let pow2 = |log: usize| -> Result<usize, String> {
+        let shift = u32::try_from(log).map_err(|_| "L0 shift overflow")?;
+        1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "L0 extent overflow".into())
+    };
+    let expected_witness = pow2(msg_log)?;
+    let expected_codeword = pow2(codeword_log)?;
+    let expected_tree = pow2(position_log)?
+        .checked_mul(2)
+        .and_then(|x| x.checked_sub(1))
+        .ok_or("L0 tree extent overflow")?;
+    if packed_witness.len() != expected_witness
+        || codeword.len() != expected_codeword
+        || merkle_tree.len() != expected_tree
+    {
+        return Err("precomputed L0 witness/codeword/tree length mismatch".into());
+    }
+    if lig_config.initial_k != params.log_batch_size
+        || lig_config.log_inv_rates.first().copied() != Some(params.log_inv_rate)
+        || lig_config.initial_log_num_interleaved != params.log_batch_size
+        || lig_config.initial_log_msg_cols != msg_log - params.log_batch_size
+    {
+        return Err("Ligerito initial geometry does not match commitment".into());
+    }
+    if !packed_direct.is_empty() || x_outers.is_empty() || x_outers.len()>4 {
+        return Err("basis producer supports one to four RS claims and no packed-direct claims".into());
+    }
+    if !(precomputed_s_hat_v.is_empty() || precomputed_s_hat_v.len()==x_outers.len())
+        || x_outers.iter().any(|x| x.len()!=msg_log+1)
+        || precomputed_s_hat_v.iter().flatten().any(|x|x.len()!=(1<<LOG_PACKING)) {
+        return Err("basis producer claim geometry".into());
+    }
+    backend.admit_producer(expected_witness, lig_config.initial_k)?;
+    let trace = std::env::var("PCS_TRACE").is_ok();
+    let t_total = std::time::Instant::now();
+
+    assert_eq!(
+        lig_config.initial_k, commitment.params.log_batch_size,
+        "ligerito initial_k ({}) must match PcsParams.log_batch_size ({}) for L0 reuse",
+        lig_config.initial_k, commitment.params.log_batch_size,
+    );
+    assert_eq!(
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+        "ligerito log_inv_rates[0] ({}) must match PcsParams.log_inv_rate ({}) for L0 reuse",
+        lig_config.log_inv_rates[0], commitment.params.log_inv_rate,
+    );
+
+    // Frontend transcript is consumed exactly once. Descriptor rejection after
+    // this point is fatal to this attempt; never rerun on the same challenger.
+    let bundle = prepare_claim_bundle(&packed_witness, x_outers,
+        precomputed_s_hat_v, packed_direct, padding, challenger, trace);
+    let target=bundle.target_combined;
+    let (ring_switches, descriptors): (Vec<_>,Vec<_>) = bundle.rs_results
+        .into_iter().map(|(proof,output)|(proof,output.rs_eq_ind)).unzip();
+    // Descriptors carry gamma already. Target alone uses gamma*original claim.
+    let round0=backend.produce(packed_witness,&descriptors,lig_config.initial_k)?;
+    drop(descriptors);
+    let t=std::time::Instant::now();
+    let ligerito_proof=ligerito::resident_prefix::prove_with_started_backend(
+        lig_config,expected_witness,target,codeword,merkle_tree,round0,challenger,backend)?;
+    if trace {
+        eprintln!(
+            "  [open_batch] ligerito::recursive_prover_with_basis: {:6.2} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        eprintln!(
+            "  [open_batch] TOTAL: {:6.2} ms",
+            t_total.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    Ok(BatchOpeningProofLigerito {
+        ring_switches,
+        ligerito: ligerito_proof,
+    })
+}
+#[cfg(all(test,feature="resident-pcs-producer"))]
+mod basis_producer_api_tests;

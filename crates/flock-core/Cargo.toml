@@ -7,6 +7,7 @@ authors.workspace = true
 description = "Protocol library and verifier for the Flock R1CS-over-GF(2) PIOP."
 
 [features]
+resident-pcs-producer = ["resident-pcs-prefix"]
 resident-pcs-prefix = []
 # Experimental external AB arithmetic, original APIs unchanged.
 resident-ab-backend = []
