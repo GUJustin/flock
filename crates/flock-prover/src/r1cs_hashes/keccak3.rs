@@ -165,8 +165,17 @@ fn fill_subkeccak(
     a_u64: &mut [u64],
     b_u64: &mut [u64],
 ) {
+    fill_subkeccak_lanes(i, state_to_lanes(initial), z_u64, a_u64, b_u64);
+}
+
+fn fill_subkeccak_lanes(
+    i: usize,
+    mut state_lanes: Lanes,
+    z_u64: &mut [u64],
+    a_u64: &mut [u64],
+    b_u64: &mut [u64],
+) {
     // state_0 input self-loops.
-    let mut state_lanes: Lanes = state_to_lanes(initial);
     let s0_base = state_u64_base(i, 0);
     for lane in 0..N_LANES {
         let pos = s0_base + lane;
@@ -246,6 +255,39 @@ fn build_block_witness_into(
         fill_subkeccak(i, &triple[i], z_u64, a_u64, b_u64);
     }
     // Trailing padding stays zero.
+}
+
+/// Construct one complete packed block directly from its three lane states.
+/// Every destination cell is initialized, including padding and constant pins.
+/// The circuit and layout are identical to the ordinary packed producer.
+pub fn generate_block_witness_from_lanes_into(
+    initial: &[Lanes; N_SUB],
+    z: &mut [F128],
+    a: &mut [F128],
+    b: &mut [F128],
+) {
+    assert_eq!(z.len(), K / 128);
+    assert_eq!(a.len(), K / 128);
+    assert_eq!(b.len(), K / 128);
+    z.fill(F128::ZERO);
+    a.fill(F128::ZERO);
+    b.fill(F128::ZERO);
+    // SAFETY: F128 is repr(C, align(16)), with two u64 fields in LE order.
+    // The initialized, exclusive slices contain exactly K/64 u64 lanes.
+    // This is the same representation used by the ordinary packed driver.
+    let (z, a, b) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(z.as_mut_ptr().cast::<u64>(), K / 64),
+            std::slice::from_raw_parts_mut(a.as_mut_ptr().cast::<u64>(), K / 64),
+            std::slice::from_raw_parts_mut(b.as_mut_ptr().cast::<u64>(), K / 64),
+        )
+    };
+    z[Z_CONST_U64] = 1;
+    a[Z_CONST_U64] = 1;
+    b[Z_CONST_U64] = 1;
+    for (i, state) in initial.iter().enumerate() {
+        fill_subkeccak_lanes(i, *state, z, a, b);
+    }
 }
 
 /// Group a flat list of keccak inputs into 3-wide blocks (padding the final
@@ -960,3 +1002,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "keccak3_direct_tests.rs"]
+mod direct_block_tests;
