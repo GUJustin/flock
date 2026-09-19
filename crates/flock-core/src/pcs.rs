@@ -115,6 +115,79 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
     lig_config: &ligerito::ProverConfig,
     challenger: &mut Ch,
 ) -> BatchOpeningProofLigerito {
+    open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_codeword(
+        packed_witness,
+        &prover_data.codeword,
+        &prover_data.merkle_tree,
+        commitment,
+        x_outers,
+        precomputed_s_hat_v,
+        packed_direct,
+        padding,
+        lig_config,
+        challenger,
+    )
+    .expect("invalid precomputed L0 opening geometry")
+}
+
+/// Open with externally owned, immutable L0 codeword and Merkle tree slices.
+///
+/// The caller retains both owners through this synchronous call. This does not
+/// take ownership, recycle either allocation, or change the opening transcript.
+/// Geometry/length errors return before the challenger is read or mutated.
+/// Codeword contents and tree authentication remain the caller's responsibility,
+/// exactly as for [`open_batch_mixed_ligerito_with_precomputed_s_hat_v`].
+#[allow(clippy::too_many_arguments)]
+pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v_and_codeword<Ch: Challenger>(
+    packed_witness: Vec<F128>,
+    codeword: &[F128],
+    merkle_tree: &[crate::merkle::Hash],
+    commitment: &Commitment,
+    x_outers: &[&[F128]],
+    precomputed_s_hat_v: &[Option<&[F128]>],
+    packed_direct: &[PackedDirectClaim],
+    padding: &PaddingSpec,
+    lig_config: &ligerito::ProverConfig,
+    challenger: &mut Ch,
+) -> Result<BatchOpeningProofLigerito, String> {
+    // Avoid unchecked PcsParams shifts/subtractions on untrusted geometry.
+    let params = &commitment.params;
+    let msg_log = params
+        .m
+        .checked_sub(LOG_PACKING)
+        .ok_or("m below packing log")?;
+    let position_log = msg_log
+        .checked_sub(params.log_batch_size)
+        .and_then(|x| x.checked_add(params.log_inv_rate))
+        .ok_or("invalid L0 position geometry")?;
+    let codeword_log = msg_log
+        .checked_add(params.log_inv_rate)
+        .ok_or("L0 codeword log overflow")?;
+    let pow2 = |log: usize| -> Result<usize, String> {
+        let shift = u32::try_from(log).map_err(|_| "L0 shift overflow")?;
+        1usize
+            .checked_shl(shift)
+            .ok_or_else(|| "L0 extent overflow".into())
+    };
+    let expected_witness = pow2(msg_log)?;
+    let expected_codeword = pow2(codeword_log)?;
+    let expected_tree = pow2(position_log)?
+        .checked_mul(2)
+        .and_then(|x| x.checked_sub(1))
+        .ok_or("L0 tree extent overflow")?;
+    if packed_witness.len() != expected_witness
+        || codeword.len() != expected_codeword
+        || merkle_tree.len() != expected_tree
+    {
+        return Err("precomputed L0 witness/codeword/tree length mismatch".into());
+    }
+    if lig_config.initial_k != params.log_batch_size
+        || lig_config.log_inv_rates.first().copied() != Some(params.log_inv_rate)
+        || lig_config.initial_log_num_interleaved != params.log_batch_size
+        || lig_config.initial_log_msg_cols != msg_log - params.log_batch_size
+    {
+        return Err("Ligerito initial geometry does not match commitment".into());
+    }
     let trace = std::env::var("PCS_TRACE").is_ok();
     let t_total = std::time::Instant::now();
 
@@ -145,8 +218,8 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         packed_witness,
         combined.b_combined,
         combined.target_combined,
-        &prover_data.codeword,
-        &prover_data.merkle_tree,
+        codeword,
+        merkle_tree,
         combined.round0_prime,
         challenger,
     );
@@ -161,10 +234,10 @@ pub fn open_batch_mixed_ligerito_with_precomputed_s_hat_v<Ch: Challenger>(
         );
     }
 
-    BatchOpeningProofLigerito {
+    Ok(BatchOpeningProofLigerito {
         ring_switches: combined.ring_switches,
         ligerito: ligerito_proof,
-    }
+    })
 }
 
 /// What ring_switch + claim-combination produces, fed to the Ligerito backend.
@@ -1059,3 +1132,7 @@ mod tests {
         .unwrap_or_else(|e| panic!("ligerito verify rejected honest proof: {e:?}"));
     }
 }
+
+#[cfg(test)]
+#[path = "pcs/borrowed_opening_tests.rs"]
+mod borrowed_opening_tests;
