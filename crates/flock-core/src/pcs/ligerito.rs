@@ -7501,3 +7501,6 @@ mod tests {
         assert_eq!(w.root(), w2.root());
     }
 }
+
+#[cfg(feature = "resident-pcs-prefix")]
+pub mod resident_prefix;
